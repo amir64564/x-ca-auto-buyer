@@ -5,7 +5,8 @@ export function extractBaseAddresses(text: string): string[] {
 }
 
 export function tickerMatches(text: string, ticker: string): boolean {
-  const normalized = ticker.replace(/^\$/, '').toUpperCase();
-  const re = new RegExp(`(^|[^A-Z0-9_])\\$?${normalized.replace(/[.*+?^${}()|[\\]\\]/g, '\\$&')}(?=$|[^A-Z0-9_])`, 'i');
-  return re.test(text);
+  const normalized = ticker.replace(/^\$/, '').trim().toUpperCase();
+  if (!normalized) return false;
+  const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^A-Z0-9_])\\$?${escaped}(?=$|[^A-Z0-9_])`, 'i').test(text);
 }
