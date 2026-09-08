@@ -35,6 +35,7 @@ export const config = {
   pollIntervalMs: Math.max(500, Number(process.env.POLL_INTERVAL_MS ?? 1000)),
   dryRun: bool('DRY_RUN', true),
   autoBuy: bool('AUTO_BUY', false),
+  snipingEnabled: bool('AUTO_BUY', false) && !bool('DRY_RUN', true),
 };
 
 export const BASE_CHAIN_ID = 8453;
