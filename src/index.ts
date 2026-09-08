@@ -1,136 +1,79 @@
-import { config } from './config.js';
-import { extractBaseAddresses, tickerMatches } from './caDetector.js';
-import { dailySpendEth, getState, hasPost, hasTradeForCa, recentTradeCount, savePost, saveTrade, setState } from './database.js';
-import { fetchRecentPosts, XPost } from './xWatcher.js';
-import { getBuyQuote, executeBuy } from './zeroXTrader.js';
-import { getEthBalance, getTokenInfo, nameMatchesTarget, symbolMatchesTarget } from './tokenChecker.js';
-import { pollTelegramCommands, sendControlPanel, sendTelegram } from './telegram.js';
-import { ethers } from 'ethers';
+import { config, validateConfig } from "./config";
+import { logger } from "./utils/logger";
+import { XPost, createXWatcher } from "./xWatcher";
+import { detectCAs } from "./caDetector";
+import { verifyBaseToken } from "./tokenChecker";
+import { getTrader } from "./trader";
+import { checkExecutionAllowed } from "./riskManager";
+import { isPostProcessed, markPostProcessed, isCAProcessed, saveDetection, createTrade, updateTrade } from "./database";
+import { initTelegram, alertCADetected, alertValidationFailed, alertTokenMatch, alertTradeRejected, alertTradeFailed, alertBuySuccess, alertBotError } from "./alerts/telegram";
 
-async function processPost(post: XPost): Promise<void> {
-  if (hasPost(post.id)) return;
+const inFlightCAs = new Set<string>();
 
-  if (config.requireTicker && !tickerMatches(post.text, config.targetTicker)) {
-    savePost(post.id);
-    return;
-  }
-
-  const addresses = extractBaseAddresses(post.text);
-  if (!addresses.length) {
-    savePost(post.id);
-    return;
-  }
-
-  for (const ca of addresses) {
-    if (hasTradeForCa(ca)) continue;
-
-    try {
-      // Identity verification is the hard safety gate. No buy until BOTH pass.
-      const token = await getTokenInfo(ca);
-      const symbolOk = symbolMatchesTarget(token.symbol);
-      const nameOk = nameMatchesTarget(token.name);
-
-      if (!symbolOk || !nameOk) {
-        const reason = `Token verification failed: symbol=${token.symbol}, name=${token.name}, expected symbol=${config.targetTicker}, name=${config.targetName}`;
-        saveTrade(post.id, config.targetTicker, ca, 'rejected', undefined, reason);
-        // Alert is intentionally deferred until after the trading path.
-        queueAlert(`⛔ BUY SKIPPED\n\nCA: ${ca}\n${reason}`);
-        continue;
-      }
-
-      const quote = await getBuyQuote(ca);
-      if (quote.liquidityAvailable === false || !quote.buyAmount || quote.buyAmount === '0') {
-        saveTrade(post.id, config.targetTicker, ca, 'rejected', undefined, 'No executable 0x liquidity');
-        queueAlert(`⛔ BUY SKIPPED\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nCA: ${ca}\nReason: 0x returned no executable liquidity.`);
-        continue;
-      }
-
-      const spend = Number(config.buyAmountEth);
-      if (recentTradeCount(1) >= config.maxTradesPerHour) throw new Error('Hourly trade limit reached');
-      if (dailySpendEth() + spend > Number(config.maxDailySpendEth)) throw new Error('Daily spend limit reached');
-
-      const balance = await getEthBalance();
-      if (balance < ethers.parseEther(config.buyAmountEth)) throw new Error('Insufficient Base ETH balance');
-
-      if (!config.snipingEnabled) {
-        saveTrade(post.id, config.targetTicker, ca, 'simulated', undefined, undefined, config.buyAmountEth);
-        queueAlert(`🟡 VERIFIED SIGNAL\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nChain: Base\nAmount: ${config.buyAmountEth} ETH\nCA: ${ca}\n\nIdentity: VERIFIED ✓\nSniping is currently CANCELLED.`);
-        continue;
-      }
-
-      // Absolutely no Telegram/network alert is awaited before this transaction.
-      saveTrade(post.id, config.targetTicker, ca, 'pending', undefined, undefined, config.buyAmountEth);
-      const result = await executeBuy(ca);
-      saveTrade(post.id, config.targetTicker, ca, 'success', result.hash, undefined, config.buyAmountEth);
-
-      // Alert happens only AFTER execution has completed and is fire-and-forget.
-      queueAlert(`🟢 SNIPER BUY SUCCESS\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nChain: Base\nAmount: ${config.buyAmountEth} ETH\nSlippage: ${(config.maxSlippageBps / 100).toFixed(0)}%\nCA: ${ca}\nTX: https://basescan.org/tx/${result.hash}`);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      saveTrade(post.id, config.targetTicker, ca, 'failed', undefined, message);
-      queueAlert(`🔴 BUY FAILED\n\nTicker: $${config.targetTicker}\nCA: ${ca}\nReason: ${message}`);
-    }
-  }
-
-  savePost(post.id);
+async function handlePost(post: XPost): Promise<void> {
+  if (isPostProcessed(post.id)) return;
+  const username = config.xUsername;
+  const cas = detectCAs(post.text, { sourcePostId: post.id, sourceUsername: username });
+  if (cas.length === 0) { markPostProcessed(post.id, username, post.text); return; }
+  await Promise.all(cas.map((ca) => processDetectedCA(ca, post)));
+  markPostProcessed(post.id, username, post.text);
 }
 
-// Alerts are deliberately low priority. They never block X polling or trade execution.
-const alertQueue: string[] = [];
-let alertSending = false;
-function queueAlert(message: string): void {
-  alertQueue.push(message);
-}
-async function flushAlerts(): Promise<void> {
-  if (alertSending || !alertQueue.length) return;
-  alertSending = true;
+async function processDetectedCA(ca: { address:string; chain:"base"; sourcePostId:string; sourceUsername:string }, post: XPost): Promise<void> {
+  if (isCAProcessed(ca.address, ca.chain)) return;
+  const key = ca.address.toLowerCase(); if (inFlightCAs.has(key)) return; inFlightCAs.add(key);
   try {
-    while (alertQueue.length) {
-      const message = alertQueue.shift();
-      if (message) {
-        try { await sendTelegram(message); } catch (error) { console.error('Telegram alert failed:', error); }
-      }
+    alertCADetected({ address: ca.address, chain: ca.chain, sourceUsername: ca.sourceUsername, sourcePostId: ca.sourcePostId });
+    const validation = await verifyBaseToken(ca.address);
+    saveDetection({ address: ca.address, chain: ca.chain, sourcePostId: ca.sourcePostId, sourceUsername: ca.sourceUsername,
+      ticker: validation.tokenInfo?.ticker, name: validation.tokenInfo?.name, decimals: validation.tokenInfo?.decimals,
+      result: validation.passed ? "match" : (validation.reason?.startsWith("invalid/reverting") ? "error" : "mismatch"), reason: validation.reason });
+
+    if (!validation.passed || !validation.tokenInfo) {
+      alertValidationFailed({ address: ca.address, chain: ca.chain, reason: validation.reason || "on-chain criteria mismatch" });
+      createTrade({ address: ca.address, chain: ca.chain, ticker: validation.tokenInfo?.ticker, sourcePostId: post.id, sourceUsername: ca.sourceUsername, status: "rejected", dryRun: true, errorMessage: validation.reason });
+      return;
     }
-  } finally {
-    alertSending = false;
+
+    alertTokenMatch({ address: ca.address, ticker: validation.tokenInfo.ticker, name: validation.tokenInfo.name, sourceUsername: ca.sourceUsername, sourcePostId: post.id });
+    const risk = checkExecutionAllowed();
+    if (!risk.allowed) {
+      alertTradeRejected({ address: ca.address, reason: risk.reason || "demo execution not allowed" });
+      createTrade({ address: ca.address, chain: ca.chain, ticker: validation.tokenInfo.ticker, sourcePostId: post.id, sourceUsername: ca.sourceUsername, status: "rejected", dryRun: true, errorMessage: risk.reason });
+      return;
+    }
+
+    await executeDemoBuy(ca.address, validation.tokenInfo.ticker, validation.tokenInfo.name, post.id, ca.sourceUsername);
+  } catch (err) {
+    logger.error("Unhandled CA processing error", { ca, error: (err as Error).message });
+    alertBotError(`CA ${ca.address}: ${(err as Error).message}`);
+  } finally { inFlightCAs.delete(key); }
+}
+
+async function executeDemoBuy(address: string, ticker: string, name: string, postId: string, username: string): Promise<void> {
+  const tradeId = createTrade({ address, chain: "base", ticker, sourcePostId: postId, sourceUsername: username, status: "pending", buyAmountEth: config.buyAmountEth, dryRun: true });
+  try {
+    const result = await getTrader().executeBuy(address, config.buyAmountEth, config.maxSlippageBps);
+    updateTrade(tradeId, { status: "simulated", txHash: result.txHash });
+    alertBuySuccess({ ticker, name, amountEth: config.buyAmountEth, address, txHash: result.txHash, simulated: true });
+  } catch (err) {
+    const message = (err as Error).message;
+    updateTrade(tradeId, { status: "failed", errorMessage: message });
+    alertTradeFailed({ address, error: message });
   }
 }
 
-async function loop(): Promise<void> {
-  queueAlert(`🤖 Sniper bot started\nX: @${config.xUsername}\nTicker: $${config.targetTicker}\nName: ${config.targetName}\nChain: Base\nPoll: ${config.pollIntervalMs}ms\nSniping: ${config.snipingEnabled ? 'ARMED' : 'CANCELLED'}`);
-  queueAlert('Use /panel for Telegram controls.');
+async function main(): Promise<void> {
+  const problems = validateConfig();
+  if (problems.length) { problems.forEach((p) => logger.error(p)); process.exit(1); }
+  initTelegram();
+  logger.info("Base CA-first DEMO bot starting", { watcher: config.xWatcherMode, user: config.xUsername, chainId: config.chainId, demoAutoBuy: config.demoAutoBuy });
 
-  let telegramOffset = Number(getState('telegram_offset') ?? 0);
+  process.on("unhandledRejection", (reason) => { logger.error("Unhandled rejection", { reason: String(reason) }); alertBotError(String(reason)); });
+  process.on("uncaughtException", (err) => { logger.error("Uncaught exception", { error: err.message }); alertBotError(err.message); });
 
-  while (true) {
-    const cycleStart = Date.now();
-    try {
-      // Telegram commands are checked, but Telegram is never awaited inside processPost.
-      const commandResult = await pollTelegramCommands(telegramOffset);
-      telegramOffset = commandResult.offset;
-      setState('telegram_offset', String(telegramOffset));
-
-      const sinceId = getState('last_x_id');
-      const posts = await fetchRecentPosts(sinceId);
-      for (const post of [...posts].reverse()) {
-        await processPost(post);
-      }
-      if (posts.length) setState('last_x_id', posts.reduce((max, p) => p.id > max ? p.id : max, posts[0].id));
-    } catch (error) {
-      console.error(error);
-      queueAlert(`⚠️ Bot error\n${error instanceof Error ? error.message : String(error)}`);
-    }
-
-    // Flush only after the scan/trade cycle, never before it.
-    void flushAlerts();
-
-    const elapsed = Date.now() - cycleStart;
-    const wait = Math.max(100, config.pollIntervalMs - elapsed);
-    await new Promise((resolve) => setTimeout(resolve, wait));
-  }
+  const watcher = createXWatcher(); watcher.onNewPost(handlePost);
+  try { await watcher.start(); }
+  catch (err) { logger.error("Watcher failed to start", { error: (err as Error).message }); alertBotError(`Watcher start failed: ${(err as Error).message}`); process.exit(1); }
 }
-
-loop().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+void main();

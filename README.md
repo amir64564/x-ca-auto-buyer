@@ -1,141 +1,41 @@
-# X CA Auto Buyer — Base
+# x-ca-auto-buyer — Demo / Test Version
 
-A small TypeScript bot that watches one X account, requires an exact ticker, extracts a Base/EVM contract address, verifies the token symbol on-chain, gets a 0x Swap API v2 quote, and (only when explicitly enabled) buys with ETH on Base.
+Base-only CA-first X monitoring and on-chain verification demo.
 
-## Safety defaults
+The project keeps the same overall structure and detection flow, but this repository is intentionally **demo-only**: it never signs, broadcasts, or submits a real on-chain swap.
 
-The repository starts in safe mode:
+## Pipeline
 
-```env
-DRY_RUN=true
-AUTO_BUY=false
-```
+`X post -> post dedupe -> CA extraction -> CA dedupe -> parallel Base RPC reads -> TARGET_TICKER/TARGET_NAME match -> Telegram alert -> simulated buy result`
 
-Do not change those until the detector and validation flow have been tested.
+The X post does **not** need to contain the ticker or token name. A valid EVM/Base contract address is extracted first, then Base is used as the authority for `name()`, `symbol()`, and `decimals()`.
 
-## What it does
+## Demo execution
 
-```text
-X account
-  ↓
-new post
-  ↓
-exact ticker check
-  ↓
-Base CA detection
-  ↓
-on-chain symbol check
-  ↓
-0x executable quote
-  ↓
-risk limits + ETH balance
-  ↓
-DRY RUN or real buy
-  ↓
-Telegram alert
-```
+`DEMO_AUTO_BUY=true` enables the simulated execution step after a token passes the configured on-chain name/symbol checks.
 
-The bot is Base-only and uses chain ID `8453`.
+The demo trader returns a `SIMULATED_*` transaction identifier and records the result in SQLite. There is no private-key wallet client, transaction signer, swap router, or broadcast path in this version.
 
-## Requirements
+## X watcher
 
-- Node.js 20+
-- An X API bearer token with access to recent search
-- A Telegram bot and chat ID
-- A 0x API key
-- A Base RPC URL
-- A dedicated EVM wallet funded only with an amount you can afford to lose
+- `X_WATCHER_MODE=api`: official X API v2 recent search, filtered to the configured username.
+- `X_WATCHER_MODE=cookie`: X web GraphQL using `X_AUTH_TOKEN` + `X_CT0`.
 
-Never commit `.env` or your private key to GitHub.
+Cookie mode uses undocumented X web endpoints/query IDs and can break if X changes authentication or endpoint behavior.
 
-## Setup
+## Telegram
 
-1. Clone the repository.
-2. Install dependencies:
+Supported runtime controls include `/stop`, `/resume`, `SLIPPAGE 20%`, and `/status`. Telegram delivery is asynchronous and is not used as a prerequisite for CA detection or Base verification.
+
+## Install
 
 ```bash
 npm install
+cp .env.example .env
+npm run build
+npm start
 ```
 
-3. Create `.env` from `.env.example`.
-4. Fill in the credentials and strategy settings.
+## Safety
 
-Example:
-
-```env
-X_BEARER_TOKEN=...
-X_USERNAME=someaccount
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
-ZEROX_API_KEY=...
-RPC_URL=https://mainnet.base.org
-PRIVATE_KEY=0xyour_private_key
-
-TARGET_TICKER=$ABC
-REQUIRE_TICKER=true
-BUY_AMOUNT_ETH=0.001
-MAX_SLIPPAGE_BPS=1000
-MAX_DAILY_SPEND_ETH=0.01
-MAX_TRADES_PER_HOUR=5
-
-DRY_RUN=true
-AUTO_BUY=false
-```
-
-## Ticker rule
-
-If `TARGET_TICKER=$ABC`, a post containing `$ABC` can continue to validation. `$ABCD` does not count as `$ABC`.
-
-The bot then reads the ERC-20 `symbol()` from the CA itself. If the on-chain symbol is not exactly `ABC`, the trade is rejected.
-
-Therefore the buy path requires both:
-
-- the X post matches the target ticker
-- the CA's on-chain token symbol matches the target ticker
-
-## Dry run
-
-Keep:
-
-```env
-DRY_RUN=true
-AUTO_BUY=false
-```
-
-Run:
-
-```bash
-npm run dev
-```
-
-The bot can detect posts, CAs, validate the token, and request a 0x quote, but it will not broadcast a trade.
-
-## Live trading
-
-Only after testing:
-
-```env
-DRY_RUN=false
-AUTO_BUY=true
-```
-
-Start with a very small `BUY_AMOUNT_ETH` and a dedicated wallet.
-
-The bot uses the 0x Swap API v2 AllowanceHolder quote endpoint. For an ETH sell, no ERC-20 approval is required. The transaction destination is taken from the 0x quote response rather than hard-coded.
-
-## Emergency stop
-
-Send `/stop` to the configured Telegram chat. The running process will stop taking further trade actions.
-
-You can also stop the process directly with Ctrl+C.
-
-## Important limitations
-
-- X polling is used instead of a private realtime stream, so detection speed depends on the X API and `POLL_INTERVAL_MS`.
-- A newly launched token may have no executable route yet. In that case the bot skips it.
-- A ticker in an X post is not proof that the CA belongs to that ticker. The on-chain symbol check is therefore mandatory.
-- This is not a guarantee against malicious contracts, taxes, honeypots, or rapid liquidity removal. Use a small dedicated wallet.
-
-## 0x API
-
-The code targets Swap API v2. Base is chain ID `8453`. API v2 requires the `0x-api-key` and `0x-version: v2` headers.
+This repository is a testing/demo build. Keep real credentials out of `.env` commits. The demo execution layer is deliberately non-custodial and simulation-only.

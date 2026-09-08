@@ -1,42 +1,39 @@
-import 'dotenv/config';
+import dotenv from "dotenv";
+import path from "path";
+import { z } from "zod";
 
-function required(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) throw new Error(`Missing required environment variable: ${name}`);
-  return value;
-}
-
-function bool(name: string, fallback: boolean): boolean {
-  const value = process.env[name];
-  return value === undefined ? fallback : value.toLowerCase() === 'true';
-}
-
-const requireName = bool('REQUIRE_NAME', true);
-const targetName = process.env.TARGET_NAME?.trim() || '';
-if (requireName && !targetName) throw new Error('TARGET_NAME is required when REQUIRE_NAME=true');
-
+dotenv.config();
+const envSchema = z.object({
+  X_WATCHER_MODE: z.enum(["cookie", "api"]).default("cookie"),
+  X_USERNAME: z.string().trim().min(1),
+  POLL_INTERVAL_MS: z.coerce.number().int().min(250).default(2000),
+  X_BEARER_TOKEN: z.string().default(""),
+  X_AUTH_TOKEN: z.string().default(""),
+  X_CT0: z.string().default(""),
+  RPC_URL: z.string().url().default("https://mainnet.base.org"),
+  TARGET_TICKER: z.string().trim().min(1),
+  TARGET_NAME: z.string().trim().min(1),
+  BUY_AMOUNT_ETH: z.coerce.number().positive().default(0.01),
+  MAX_SLIPPAGE_BPS: z.coerce.number().int().min(0).max(10000).default(2000),
+  DRY_RUN: z.string().transform((v) => v.trim().toLowerCase() === "true").default("true"),
+  DEMO_AUTO_BUY: z.string().transform((v) => v.trim().toLowerCase() === "true").default("true"),
+  TELEGRAM_BOT_TOKEN: z.string().default(""),
+  TELEGRAM_CHAT_ID: z.string().default(""),
+});
+const parsed = envSchema.safeParse(process.env);
+if (!parsed.success) { const message = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; "); throw new Error(`Invalid configuration: ${message}`); }
+const env = parsed.data;
 export const config = {
-  xBearerToken: required('X_BEARER_TOKEN'),
-  xUsername: required('X_USERNAME').replace(/^@/, ''),
-  telegramBotToken: required('TELEGRAM_BOT_TOKEN'),
-  telegramChatId: required('TELEGRAM_CHAT_ID'),
-  zeroXApiKey: required('ZEROX_API_KEY'),
-  rpcUrl: required('RPC_URL'),
-  privateKey: required('PRIVATE_KEY'),
-  targetTicker: required('TARGET_TICKER').replace(/^\$/, '').toUpperCase(),
-  requireTicker: bool('REQUIRE_TICKER', true),
-  targetName,
-  requireName,
-  buyAmountEth: process.env.BUY_AMOUNT_ETH ?? '0.001',
-  maxSlippageBps: Number(process.env.MAX_SLIPPAGE_BPS ?? 1000),
-  maxDailySpendEth: process.env.MAX_DAILY_SPEND_ETH ?? '0.01',
-  maxTradesPerHour: Number(process.env.MAX_TRADES_PER_HOUR ?? 5),
-  maxRetries: Number(process.env.MAX_RETRIES ?? 1),
-  pollIntervalMs: Math.max(500, Number(process.env.POLL_INTERVAL_MS ?? 1000)),
-  dryRun: bool('DRY_RUN', true),
-  autoBuy: bool('AUTO_BUY', false),
-  snipingEnabled: bool('AUTO_BUY', false) && !bool('DRY_RUN', true),
+  xWatcherMode: env.X_WATCHER_MODE, xUsername: env.X_USERNAME.replace(/^@/, ""), xPollIntervalMs: env.POLL_INTERVAL_MS, xBearerToken: env.X_BEARER_TOKEN, xAuthToken: env.X_AUTH_TOKEN, xCt0: env.X_CT0,
+  chainId: 8453 as const, rpcUrl: env.RPC_URL,
+  targetTicker: env.TARGET_TICKER, targetName: env.TARGET_NAME, buyAmountEth: env.BUY_AMOUNT_ETH, maxSlippageBps: env.MAX_SLIPPAGE_BPS,
+  dryRun: true, demoAutoBuy: env.DEMO_AUTO_BUY,
+  telegramBotToken: env.TELEGRAM_BOT_TOKEN, telegramChatId: env.TELEGRAM_CHAT_ID, databasePath: path.resolve("data", "bot.db"),
 };
-
-export const BASE_CHAIN_ID = 8453;
-export const ETH = '0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE';
+export function validateConfig(): string[] {
+  const problems: string[] = [];
+  if (config.xWatcherMode === "api" && !config.xBearerToken) problems.push("X_BEARER_TOKEN is required for X_WATCHER_MODE=api");
+  if (config.xWatcherMode === "cookie" && (!config.xAuthToken || !config.xCt0)) problems.push("X_AUTH_TOKEN and X_CT0 are required for X_WATCHER_MODE=cookie");
+  if (!config.demoAutoBuy) problems.push("DEMO_AUTO_BUY should remain true for the demo build");
+  return problems;
+}
