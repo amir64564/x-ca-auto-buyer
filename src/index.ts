@@ -7,8 +7,6 @@ import { getEthBalance, getTokenInfo, nameMatchesTarget, symbolMatchesTarget } f
 import { pollTelegramCommands, sendControlPanel, sendTelegram } from './telegram.js';
 import { ethers } from 'ethers';
 
-let telegramOffset = Number(getState('telegram_offset') ?? 0);
-
 async function processPost(post: XPost): Promise<void> {
   if (hasPost(post.id)) return;
 
@@ -27,6 +25,7 @@ async function processPost(post: XPost): Promise<void> {
     if (hasTradeForCa(ca)) continue;
 
     try {
+      // Identity verification is the hard safety gate. No buy until BOTH pass.
       const token = await getTokenInfo(ca);
       const symbolOk = symbolMatchesTarget(token.symbol);
       const nameOk = nameMatchesTarget(token.name);
@@ -34,14 +33,15 @@ async function processPost(post: XPost): Promise<void> {
       if (!symbolOk || !nameOk) {
         const reason = `Token verification failed: symbol=${token.symbol}, name=${token.name}, expected symbol=${config.targetTicker}, name=${config.targetName}`;
         saveTrade(post.id, config.targetTicker, ca, 'rejected', undefined, reason);
-        await sendTelegram(`⛔ BUY SKIPPED\n\nCA: ${ca}\n${reason}`);
+        // Alert is intentionally deferred until after the trading path.
+        queueAlert(`⛔ BUY SKIPPED\n\nCA: ${ca}\n${reason}`);
         continue;
       }
 
       const quote = await getBuyQuote(ca);
       if (quote.liquidityAvailable === false || !quote.buyAmount || quote.buyAmount === '0') {
         saveTrade(post.id, config.targetTicker, ca, 'rejected', undefined, 'No executable 0x liquidity');
-        await sendTelegram(`⛔ BUY SKIPPED\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nCA: ${ca}\nReason: 0x returned no executable liquidity.`);
+        queueAlert(`⛔ BUY SKIPPED\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nCA: ${ca}\nReason: 0x returned no executable liquidity.`);
         continue;
       }
 
@@ -54,33 +54,58 @@ async function processPost(post: XPost): Promise<void> {
 
       if (!config.snipingEnabled) {
         saveTrade(post.id, config.targetTicker, ca, 'simulated', undefined, undefined, config.buyAmountEth);
-        await sendTelegram(`🟡 VERIFIED SIGNAL\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nChain: Base\nAmount: ${config.buyAmountEth} ETH\nCA: ${ca}\n\nIdentity: VERIFIED ✓\nSniping is currently CANCELLED.`);
+        queueAlert(`🟡 VERIFIED SIGNAL\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nChain: Base\nAmount: ${config.buyAmountEth} ETH\nCA: ${ca}\n\nIdentity: VERIFIED ✓\nSniping is currently CANCELLED.`);
         continue;
       }
 
-      // Keep Telegram alerts out of the critical execution path.
+      // Absolutely no Telegram/network alert is awaited before this transaction.
       saveTrade(post.id, config.targetTicker, ca, 'pending', undefined, undefined, config.buyAmountEth);
       const result = await executeBuy(ca);
       saveTrade(post.id, config.targetTicker, ca, 'success', result.hash, undefined, config.buyAmountEth);
 
-      // Mandatory post-execution alert.
-      await sendTelegram(`🟢 SNIPER BUY SUCCESS\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nChain: Base\nAmount: ${config.buyAmountEth} ETH\nSlippage: ${(config.maxSlippageBps / 100).toFixed(0)}%\nCA: ${ca}\nTX: https://basescan.org/tx/${result.hash}`);
+      // Alert happens only AFTER execution has completed and is fire-and-forget.
+      queueAlert(`🟢 SNIPER BUY SUCCESS\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nChain: Base\nAmount: ${config.buyAmountEth} ETH\nSlippage: ${(config.maxSlippageBps / 100).toFixed(0)}%\nCA: ${ca}\nTX: https://basescan.org/tx/${result.hash}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       saveTrade(post.id, config.targetTicker, ca, 'failed', undefined, message);
-      await sendTelegram(`🔴 BUY FAILED\n\nTicker: $${config.targetTicker}\nCA: ${ca}\nReason: ${message}`);
+      queueAlert(`🔴 BUY FAILED\n\nTicker: $${config.targetTicker}\nCA: ${ca}\nReason: ${message}`);
     }
   }
 
   savePost(post.id);
 }
 
+// Alerts are deliberately low priority. They never block X polling or trade execution.
+const alertQueue: string[] = [];
+let alertSending = false;
+function queueAlert(message: string): void {
+  alertQueue.push(message);
+}
+async function flushAlerts(): Promise<void> {
+  if (alertSending || !alertQueue.length) return;
+  alertSending = true;
+  try {
+    while (alertQueue.length) {
+      const message = alertQueue.shift();
+      if (message) {
+        try { await sendTelegram(message); } catch (error) { console.error('Telegram alert failed:', error); }
+      }
+    }
+  } finally {
+    alertSending = false;
+  }
+}
+
 async function loop(): Promise<void> {
-  await sendTelegram(`🤖 Sniper bot started\nX: @${config.xUsername}\nTicker: $${config.targetTicker}\nName: ${config.targetName}\nChain: Base\nPoll: ${config.pollIntervalMs}ms\nSniping: ${config.snipingEnabled ? 'ARMED' : 'CANCELLED'}`);
-  await sendControlPanel();
+  queueAlert(`🤖 Sniper bot started\nX: @${config.xUsername}\nTicker: $${config.targetTicker}\nName: ${config.targetName}\nChain: Base\nPoll: ${config.pollIntervalMs}ms\nSniping: ${config.snipingEnabled ? 'ARMED' : 'CANCELLED'}`);
+  queueAlert('Use /panel for Telegram controls.');
+
+  let telegramOffset = Number(getState('telegram_offset') ?? 0);
 
   while (true) {
+    const cycleStart = Date.now();
     try {
+      // Telegram commands are checked, but Telegram is never awaited inside processPost.
       const commandResult = await pollTelegramCommands(telegramOffset);
       telegramOffset = commandResult.offset;
       setState('telegram_offset', String(telegramOffset));
@@ -93,9 +118,15 @@ async function loop(): Promise<void> {
       if (posts.length) setState('last_x_id', posts.reduce((max, p) => p.id > max ? p.id : max, posts[0].id));
     } catch (error) {
       console.error(error);
-      try { await sendTelegram(`⚠️ Bot error\n${error instanceof Error ? error.message : String(error)}`); } catch { /* ignore alert failure */ }
+      queueAlert(`⚠️ Bot error\n${error instanceof Error ? error.message : String(error)}`);
     }
-    await new Promise((resolve) => setTimeout(resolve, config.pollIntervalMs));
+
+    // Flush only after the scan/trade cycle, never before it.
+    void flushAlerts();
+
+    const elapsed = Date.now() - cycleStart;
+    const wait = Math.max(100, config.pollIntervalMs - elapsed);
+    await new Promise((resolve) => setTimeout(resolve, wait));
   }
 }
 
