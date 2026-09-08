@@ -1,0 +1,23 @@
+{
+  "name": "x-ca-auto-buyer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Base meme-coin X account watcher with strict ticker filtering and 0x Swap API v2 execution.",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.10.0",
+    "dotenv": "^16.6.1",
+    "ethers": "^6.15.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.3.0",
+    "tsx": "^4.20.3",
+    "typescript": "^5.9.2"
+  }
+}
