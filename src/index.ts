@@ -4,7 +4,7 @@ import { dailySpendEth, getState, hasPost, hasTradeForCa, recentTradeCount, save
 import { fetchRecentPosts, XPost } from './xWatcher.js';
 import { getBuyQuote, executeBuy } from './zeroXTrader.js';
 import { getEthBalance, getTokenInfo, nameMatchesTarget, symbolMatchesTarget } from './tokenChecker.js';
-import { pollTelegramCommands, sendTelegram } from './telegram.js';
+import { pollTelegramCommands, sendControlPanel, sendTelegram } from './telegram.js';
 import { ethers } from 'ethers';
 
 let stopped = false;
@@ -13,13 +13,11 @@ let telegramOffset = Number(getState('telegram_offset') ?? 0);
 async function processPost(post: XPost): Promise<void> {
   if (hasPost(post.id)) return;
 
-  // Fast gate #1: the configured ticker must appear in the X post.
   if (config.requireTicker && !tickerMatches(post.text, config.targetTicker)) {
     savePost(post.id);
     return;
   }
 
-  // Fast gate #2: extract the Base/EVM contract immediately.
   const addresses = extractBaseAddresses(post.text);
   if (!addresses.length) {
     savePost(post.id);
@@ -30,8 +28,6 @@ async function processPost(post: XPost): Promise<void> {
     if (hasTradeForCa(ca)) continue;
 
     try {
-      // Security gate: the CA must resolve on Base and BOTH the on-chain symbol
-      // and token name must match the configured target before a buy is allowed.
       const token = await getTokenInfo(ca);
       const symbolOk = symbolMatchesTarget(token.symbol);
       const nameOk = nameMatchesTarget(token.name);
@@ -43,7 +39,6 @@ async function processPost(post: XPost): Promise<void> {
         continue;
       }
 
-      // Only after both identity checks pass do we request a live executable quote.
       const quote = await getBuyQuote(ca);
       if (quote.liquidityAvailable === false || !quote.buyAmount || quote.buyAmount === '0') {
         saveTrade(post.id, config.targetTicker, ca, 'rejected', undefined, 'No executable 0x liquidity');
@@ -58,18 +53,19 @@ async function processPost(post: XPost): Promise<void> {
       const balance = await getEthBalance();
       if (balance < ethers.parseEther(config.buyAmountEth)) throw new Error('Insufficient Base ETH balance');
 
-      if (config.dryRun || !config.autoBuy) {
+      if (!config.snipingEnabled) {
         saveTrade(post.id, config.targetTicker, ca, 'simulated', undefined, undefined, config.buyAmountEth);
-        await sendTelegram(`🟡 SIMULATED SNIPER BUY\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nChain: Base\nAmount: ${config.buyAmountEth} ETH\nCA: ${ca}\n\nIdentity: VERIFIED ✓\nDRY_RUN=${config.dryRun}\nAUTO_BUY=${config.autoBuy}`);
+        await sendTelegram(`🟡 VERIFIED SIGNAL\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nChain: Base\nAmount: ${config.buyAmountEth} ETH\nCA: ${ca}\n\nIdentity: VERIFIED ✓\nSniping is currently CANCELLED.`);
         continue;
       }
 
-      // No Telegram notification is sent before the buy: alerts must never sit
-      // in the critical execution path.
+      // Keep Telegram alerts out of the critical execution path.
       saveTrade(post.id, config.targetTicker, ca, 'pending', undefined, undefined, config.buyAmountEth);
       const result = await executeBuy(ca);
       saveTrade(post.id, config.targetTicker, ca, 'success', result.hash, undefined, config.buyAmountEth);
-      await sendTelegram(`🟢 SNIPER BUY SUCCESS\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nChain: Base\nAmount: ${config.buyAmountEth} ETH\nCA: ${ca}\nTX: https://basescan.org/tx/${result.hash}`);
+
+      // Mandatory post-execution alert.
+      await sendTelegram(`🟢 SNIPER BUY SUCCESS\n\nTicker: $${config.targetTicker}\nName: ${token.name}\nChain: Base\nAmount: ${config.buyAmountEth} ETH\nSlippage: ${(config.maxSlippageBps / 100).toFixed(0)}%\nCA: ${ca}\nTX: https://basescan.org/tx/${result.hash}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       saveTrade(post.id, config.targetTicker, ca, 'failed', undefined, message);
@@ -81,7 +77,8 @@ async function processPost(post: XPost): Promise<void> {
 }
 
 async function loop(): Promise<void> {
-  await sendTelegram(`🤖 Sniper bot started\nX: @${config.xUsername}\nTicker: $${config.targetTicker}\nName: ${config.targetName}\nChain: Base\nPoll: ${config.pollIntervalMs}ms\nDRY_RUN=${config.dryRun}\nAUTO_BUY=${config.autoBuy}`);
+  await sendTelegram(`🤖 Sniper bot started\nX: @${config.xUsername}\nTicker: $${config.targetTicker}\nName: ${config.targetName}\nChain: Base\nPoll: ${config.pollIntervalMs}ms\nSniping: ${config.snipingEnabled ? 'ARMED' : 'CANCELLED'}`);
+  await sendControlPanel();
 
   while (!stopped) {
     try {
@@ -89,14 +86,13 @@ async function loop(): Promise<void> {
       telegramOffset = commandResult.offset;
       setState('telegram_offset', String(telegramOffset));
       if (commandResult.stop) {
+        // This stops future buys. A transaction already submitted to Base cannot be cancelled here.
         stopped = true;
-        await sendTelegram('🛑 Emergency stop received. Bot will not execute more buys.');
         break;
       }
 
       const sinceId = getState('last_x_id');
       const posts = await fetchRecentPosts(sinceId);
-      // Newest posts are processed first so the latest launch is not delayed by older posts.
       for (const post of [...posts].reverse()) {
         await processPost(post);
       }
