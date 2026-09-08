@@ -7,7 +7,6 @@ import { getEthBalance, getTokenInfo, nameMatchesTarget, symbolMatchesTarget } f
 import { pollTelegramCommands, sendControlPanel, sendTelegram } from './telegram.js';
 import { ethers } from 'ethers';
 
-let stopped = false;
 let telegramOffset = Number(getState('telegram_offset') ?? 0);
 
 async function processPost(post: XPost): Promise<void> {
@@ -80,16 +79,11 @@ async function loop(): Promise<void> {
   await sendTelegram(`🤖 Sniper bot started\nX: @${config.xUsername}\nTicker: $${config.targetTicker}\nName: ${config.targetName}\nChain: Base\nPoll: ${config.pollIntervalMs}ms\nSniping: ${config.snipingEnabled ? 'ARMED' : 'CANCELLED'}`);
   await sendControlPanel();
 
-  while (!stopped) {
+  while (true) {
     try {
       const commandResult = await pollTelegramCommands(telegramOffset);
       telegramOffset = commandResult.offset;
       setState('telegram_offset', String(telegramOffset));
-      if (commandResult.stop) {
-        // This stops future buys. A transaction already submitted to Base cannot be cancelled here.
-        stopped = true;
-        break;
-      }
 
       const sinceId = getState('last_x_id');
       const posts = await fetchRecentPosts(sinceId);
