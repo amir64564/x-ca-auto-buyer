@@ -1,9 +1,15 @@
 import { BuyResult, Trader } from "./trader";
+import { getUniswapV3DemoQuote } from "./uniswapV3Demo";
 
-/** Demo-only trader. It deliberately never signs or broadcasts an on-chain transaction. */
+/** Demo trader: uses the real Base/Uniswap V3 pool + quote path, but never signs or broadcasts a transaction. */
 class DemoTrader implements Trader {
   async executeBuy(address: string, buyAmountEth: number, maxSlippageBps: number): Promise<BuyResult> {
-    return { txHash: `SIMULATED_${Date.now()}_${address.slice(2, 10)}`, quotedTokenAmount: 0n, minTokenAmount: 0n };
+    const quote = await getUniswapV3DemoQuote(address);
+    return {
+      txHash: `SIMULATED_UNISWAP_V3_${Date.now()}_${address.slice(2, 10)}`,
+      quotedTokenAmount: quote.amountOutWei,
+      minTokenAmount: quote.amountOutMinimumWei,
+    };
   }
 }
 
