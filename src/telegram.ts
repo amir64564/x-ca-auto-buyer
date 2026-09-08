@@ -27,7 +27,7 @@ export async function sendTelegram(message: string): Promise<void> {
 export async function sendControlPanel(): Promise<void> {
   await telegramApi('sendMessage', {
     chat_id: config.telegramChatId,
-    text: `🎯 SNIPER CONTROL\n\nSlippage: ${(config.maxSlippageBps / 100).toFixed(0)}%\nStatus: ${config.autoBuy && !config.dryRun ? 'LIVE' : 'DRY RUN'}`,
+    text: `🎯 SNIPER CONTROL\n\nSlippage: ${(config.maxSlippageBps / 100).toFixed(0)}%\nStatus: ${config.snipingEnabled ? 'ARMED' : 'CANCELLED'}`,
     reply_markup: {
       inline_keyboard: [
         [
@@ -73,13 +73,15 @@ export async function pollTelegramCommands(offset = 0): Promise<TelegramCommandR
     const data = update.callback_query?.data;
 
     if (text === '/stop' || text === '/cancel' || data === 'stop') {
+      config.snipingEnabled = false;
       stop = true;
-      config.autoBuy = false;
       await sendTelegram('🛑 Sniping cancelled. No new buys will be executed.');
     } else if (text === '/resume' || data === 'resume') {
-      config.autoBuy = true;
-      config.dryRun = false;
-      await sendTelegram(`▶️ Sniping resumed. Slippage: ${(config.maxSlippageBps / 100).toFixed(0)}%`);
+      // Resume only if LIVE buying was explicitly enabled in .env.
+      config.snipingEnabled = config.autoBuy && !config.dryRun;
+      await sendTelegram(config.snipingEnabled
+        ? `▶️ Sniping resumed. Slippage: ${(config.maxSlippageBps / 100).toFixed(0)}%`
+        : '⚠️ Resume ignored. Set AUTO_BUY=true and DRY_RUN=false in .env for live mode.');
     } else if (data?.startsWith('slip:')) {
       const bps = Number(data.slice(5));
       if ([500, 1000, 2000, 4000].includes(bps)) {
